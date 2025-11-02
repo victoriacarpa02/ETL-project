@@ -1,0 +1,186 @@
+trigger: none
+
+schedules:
+  - cron: "0 7 * * 6" # Каждую субботу в 07:00 UTC
+    displayName: "Weekly Backup (Saturday 07:00 UTC)"
+    branches:
+      include:
+        - main
+    always: true
+
+stages:
+  - stage: Backup
+    displayName: "ADF, Databricks & Storage Weekly Backup"
+    jobs:
+      - job: BackupJob
+        displayName: "Perform Full Backup"
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        variables:
+          STORAGE_ACCOUNT: "etlcodebase"
+          BACKUP_CONTAINER: "backup"
+          DEPENDENCIES_CONTAINER: "dependencies"
+          RESULTS_CONTAINER: "results"
+          TFSTATE_CONTAINER: "tfstate"
+          ADF_NAME: "etl-diploma-adf"
+          RESOURCE_GROUP: "etl-diploma-rg"
+          SUBSCRIPTION_ID: "$(AzureSubscriptionID)"
+          TENANT_ID: "$(AzureTenantID)"
+          CLIENT_ID: "$(AzureClientID)"
+          CLIENT_SECRET: "$(AzureClientSecret)"
+          DATABRICKS_HOST: "$(DatabricksHost)"
+          DATABRICKS_TOKEN: "$(DatabricksToken)"
+
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Login to Azure via Service Connection"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: echo "Logged into Azure successfully."
+
+          # --- 1. Download ADF resources via REST API script ---
+          - task: Bash@3
+            displayName: "Download ADF resources using Python script"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                mkdir -p /tmp/backup_temp/adf/{pipelines,datasets,linkedServices,triggers}
+
+                echo "Creating list files for each ADF resource type..."
+                echo "$(az datafactory pipeline list --factory-name $ADF_NAME -g $RESOURCE_GROUP --query "[].name" -o tsv)" > /tmp/pipelines.txt
+                echo "$(az datafactory dataset list --factory-name $ADF_NAME -g $RESOURCE_GROUP --query "[].name" -o tsv)" > /tmp/datasets.txt
+                echo "$(az datafactory linked-service list --factory-name $ADF_NAME -g $RESOURCE_GROUP --query "[].name" -o tsv)" > /tmp/linkedservices.txt
+                echo "$(az datafactory trigger list --factory-name $ADF_NAME -g $RESOURCE_GROUP --query "[].name" -o tsv)" > /tmp/triggers.txt
+
+                echo "Downloading ADF pipelines..."
+                python3 scripts/get_adf_items.py \
+                    --subscription_id $SUBSCRIPTION_ID \
+                    --tenant_id $TENANT_ID \
+                    --client_id $CLIENT_ID \
+                    --client_secret $CLIENT_SECRET \
+                    --resource_group_name $RESOURCE_GROUP \
+                    --data_factory_name $ADF_NAME \
+                    --item_list /tmp/pipelines.txt \
+                    --file_type pipeline \
+                    --output_dir /tmp/backup_temp/adf/pipelines \
+                    --fail_if_absent false
+
+                echo "Downloading ADF datasets..."
+                python3 scripts/get_adf_items.py \
+                    --subscription_id $SUBSCRIPTION_ID \
+                    --tenant_id $TENANT_ID \
+                    --client_id $CLIENT_ID \
+                    --client_secret $CLIENT_SECRET \
+                    --resource_group_name $RESOURCE_GROUP \
+                    --data_factory_name $ADF_NAME \
+                    --item_list /tmp/datasets.txt \
+                    --file_type dataset \
+                    --output_dir /tmp/backup_temp/adf/datasets \
+                    --fail_if_absent false
+
+                echo "Downloading ADF linked services..."
+                python3 scripts/get_adf_items.py \
+                    --subscription_id $SUBSCRIPTION_ID \
+                    --tenant_id $TENANT_ID \
+                    --client_id $CLIENT_ID \
+                    --client_secret $CLIENT_SECRET \
+                    --resource_group_name $RESOURCE_GROUP \
+                    --data_factory_name $ADF_NAME \
+                    --item_list /tmp/linkedservices.txt \
+                    --file_type linkedService \
+                    --output_dir /tmp/backup_temp/adf/linkedServices \
+                    --fail_if_absent false
+
+                echo "Downloading ADF triggers..."
+                python3 scripts/get_adf_items.py \
+                    --subscription_id $SUBSCRIPTION_ID \
+                    --tenant_id $TENANT_ID \
+                    --client_id $CLIENT_ID \
+                    --client_secret $CLIENT_SECRET \
+                    --resource_group_name $RESOURCE_GROUP \
+                    --data_factory_name $ADF_NAME \
+                    --item_list /tmp/triggers.txt \
+                    --file_type trigger \
+                    --output_dir /tmp/backup_temp/adf/triggers \
+                    --fail_if_absent false
+
+          # --- 2. Download Databricks notebooks ---
+          - task: Bash@3
+            displayName: "Download Databricks notebooks"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                mkdir -p /tmp/backup_temp/databricks/notebooks
+                python3 scripts/download_databricks_notebooks.py \
+                  --host "$DATABRICKS_HOST" \
+                  --token "$DATABRICKS_TOKEN" \
+                  --output "/tmp/backup_temp/databricks/notebooks"
+
+          # --- 3. Copy dependencies, results, tfstate containers ---
+          - task: AzureCLI@2
+            displayName: "Copy Storage containers to backup"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+                echo "##[debug]Downloading dependencies..."
+                az storage blob download-batch \
+                  --account-name $STORAGE_ACCOUNT \
+                  --source $DEPENDENCIES_CONTAINER \
+                  --destination /tmp/backup_temp/dependencies \
+                  --no-progress
+
+                echo "##[debug]Downloading results..."
+                az storage blob download-batch \
+                  --account-name $STORAGE_ACCOUNT \
+                  --source $RESULTS_CONTAINER \
+                  --destination /tmp/backup_temp/results \
+                  --no-progress
+
+                echo "##[debug]Downloading tfstate..."
+                az storage blob download-batch \
+                  --account-name $STORAGE_ACCOUNT \
+                  --source $TFSTATE_CONTAINER \
+                  --destination /tmp/backup_temp/tfstate \
+                  --no-progress
+
+          # --- 4. Generate manifest.json ---
+          - task: Bash@3
+            displayName: "Generate manifest.json (for all backups)"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                python3 scripts/generate_manifest.py --root /tmp/backup_temp
+
+          # --- 5. Upload all to backup container ---
+          - task: AzureCLI@2
+            displayName: "Upload full backup to Storage Account"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -e
+
+                echo "##[debug]Uploading verified files to backup folder"
+                azcopy cp \
+                    "/tmp/backup_temp/*" \
+                    "https://${STORAGE_ACCOUNT}.dfs.core.windows.net/${BACKUP_CONTAINER}/" \
+                    --recursive=true
+
+                echo
+                echo "##[debug]Display copied files:"
+                az storage blob list \
+                  --account-name $STORAGE_ACCOUNT \
+                  --container-name $BACKUP_CONTAINER \
+                  --output tsv --query '[*].name'

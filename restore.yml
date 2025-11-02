@@ -1,0 +1,133 @@
+trigger: none
+
+stages:
+  - stage: Restore
+    displayName: "Restore from Backup"
+    jobs:
+      - job: RestoreJob
+        displayName: "Validate Manifest and Restore Resources"
+        pool:
+          vmImage: 'ubuntu-latest'
+
+        variables:
+          STORAGE_ACCOUNT: "etlcodebase"
+          BACKUP_CONTAINER: "backup"
+          DEPENDENCIES_CONTAINER: "dependencies"
+          RESULTS_CONTAINER: "results"
+          ADF_NAME: "etl-diploma-adf"
+          RESOURCE_GROUP: "etl-diploma-rg"
+          DATABRICKS_HOST: "$(DatabricksHost)"
+          DATABRICKS_TOKEN: "$(DatabricksToken)"
+
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: "Login to Azure via Service Connection"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                echo "Logged into Azure successfully."
+
+          # --- 1. Download full backup locally ---
+          - task: AzureCLI@2
+            displayName: "Download backup from Storage Account"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                mkdir -p restore_workspace
+                echo "Downloading entire backup container..."
+                az storage blob download-batch \
+                  --account-name $STORAGE_ACCOUNT \
+                  --source $BACKUP_CONTAINER \
+                  --destination restore_workspace \
+                  --no-progress
+
+          # --- 2. Validate manifest ---
+          - task: Bash@3
+            displayName: "Validate manifest.json integrity"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                python3 scripts/validate_manifest.py \
+                  --root restore_workspace \
+                  --manifest restore_workspace/manifest.json
+
+          # --- 3. Restore ADF resources ---
+          - task: AzureCLI@2
+            displayName: "Restore ADF resources (pipelines, datasets, triggers, linked services)"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                base_dir="restore_workspace/adf"
+                echo "Restoring ADF pipelines..."
+                for f in "$base_dir/pipelines"/*.json; do
+                  name=$(basename "$f" .json)
+                  echo "Restoring pipeline: $name"
+                  az datafactory pipeline create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --pipeline "@$f"
+                done
+
+                echo "Restoring datasets..."
+                for f in "$base_dir/datasets"/*.json; do
+                  name=$(basename "$f" .json)
+                  az datafactory dataset create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --properties "@$f"
+                done
+
+                echo "Restoring linked services..."
+                for f in "$base_dir/linkedServices"/*.json; do
+                  name=$(basename "$f" .json)
+                  az datafactory linked-service create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --properties "@$f"
+                done
+
+                echo "Restoring triggers..."
+                for f in "$base_dir/triggers"/*.json; do
+                  name=$(basename "$f" .json)
+                  az datafactory trigger create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --properties "@$f"
+                done
+
+          # --- 4. Restore Databricks notebooks ---
+          - task: Bash@3
+            displayName: "Restore Databricks notebooks"
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+                python3 scripts/restore_databricks_notebooks.py \
+                  --host "$(DATABRICKS_HOST)" \
+                  --token "$(DATABRICKS_TOKEN)" \
+                  --source "restore_workspace/databricks/notebooks"
+
+          # --- 5. Restore storage containers ---
+          - task: AzureCLI@2
+            displayName: "Restore dependencies and results containers"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+                echo "Restoring dependencies..."
+                az storage blob upload-batch \
+                  --account-name $STORAGE_ACCOUNT \
+                  --destination $DEPENDENCIES_CONTAINER \
+                  --source restore_workspace/dependencies \
+                  --overwrite
+
+                echo "Restoring results..."
+                az storage blob upload-batch \
+                  --account-name $STORAGE_ACCOUNT \
+                  --destination $RESULTS_CONTAINER \
+                  --source restore_workspace/results \
+                  --overwrite
+
+                echo "Restore completed successfully."
