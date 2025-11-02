@@ -1,7 +1,7 @@
 trigger: none
 
 schedules:
-  - cron: "0 7 * * 6" # Каждую субботу в 07:00 UTC
+  - cron: "0 7 * * 6"
     displayName: "Weekly Backup (Saturday 07:00 UTC)"
     branches:
       include:
