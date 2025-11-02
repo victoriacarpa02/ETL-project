@@ -2,10 +2,10 @@ trigger: none
 
 stages:
   - stage: Restore
-    displayName: "Restore from Backup"
+    displayName: "Full Infrastructure and Data Restore"
     jobs:
       - job: RestoreJob
-        displayName: "Validate Manifest and Restore Resources"
+        displayName: "Apply Terraform, Restore Databricks, Storage, and ADF"
         pool:
           vmImage: 'ubuntu-latest'
 
@@ -14,6 +14,7 @@ stages:
           BACKUP_CONTAINER: "backup"
           DEPENDENCIES_CONTAINER: "dependencies"
           RESULTS_CONTAINER: "results"
+          TFSTATE_CONTAINER: "tfstate"
           ADF_NAME: "etl-diploma-adf"
           RESOURCE_GROUP: "etl-diploma-rg"
           DATABRICKS_HOST: "$(DatabricksHost)"
@@ -28,10 +29,9 @@ stages:
               azureSubscription: "etl-service-connection"
               scriptType: bash
               scriptLocation: inlineScript
-              inlineScript: |
-                echo "Logged into Azure successfully."
+              inlineScript: echo "Logged into Azure successfully."
 
-          # --- 1. Download full backup locally ---
+          # --- 1. Download backup ---
           - task: AzureCLI@2
             displayName: "Download backup from Storage Account"
             inputs:
@@ -41,7 +41,7 @@ stages:
               inlineScript: |
                 set -euo pipefail
                 mkdir -p restore_workspace
-                echo "Downloading entire backup container..."
+                echo "Downloading full backup..."
                 az storage blob download-batch \
                   --account-name $STORAGE_ACCOUNT \
                   --source $BACKUP_CONTAINER \
@@ -59,41 +59,22 @@ stages:
                   --root restore_workspace \
                   --manifest restore_workspace/manifest.json
 
-          # --- 3. Restore ADF resources ---
-          - task: AzureCLI@2
-            displayName: "Restore ADF resources (pipelines, datasets, triggers, linked services)"
+          # --- 3. Restore infrastructure using Terraform ---
+          - task: Bash@3
+            displayName: "Restore infrastructure from tfstate (Terraform apply)"
             inputs:
-              azureSubscription: "etl-service-connection"
-              scriptType: bash
-              scriptLocation: inlineScript
-              inlineScript: |
+              targetType: inline
+              script: |
                 set -euo pipefail
+                echo "Preparing Terraform workspace..."
+                mkdir -p terraform_restore
+                cp restore_workspace/tfstate/*.tfstate terraform_restore/terraform.tfstate
 
-                base_dir="restore_workspace/adf"
-                echo "Restoring ADF pipelines..."
-                for f in "$base_dir/pipelines"/*.json; do
-                  name=$(basename "$f" .json)
-                  echo "Restoring pipeline: $name"
-                  az datafactory pipeline create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --pipeline "@$f"
-                done
-
-                echo "Restoring datasets..."
-                for f in "$base_dir/datasets"/*.json; do
-                  name=$(basename "$f" .json)
-                  az datafactory dataset create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --properties "@$f"
-                done
-
-                echo "Restoring linked services..."
-                for f in "$base_dir/linkedServices"/*.json; do
-                  name=$(basename "$f" .json)
-                  az datafactory linked-service create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --properties "@$f"
-                done
-
-                echo "Restoring triggers..."
-                for f in "$base_dir/triggers"/*.json; do
-                  name=$(basename "$f" .json)
-                  az datafactory trigger create --name "$name" --factory-name $ADF_NAME --resource-group $RESOURCE_GROUP --properties "@$f"
-                done
+                cd terraform_restore
+                echo "Initializing Terraform..."
+                terraform init -input=false
+                echo "Applying Terraform state..."
+                terraform apply -auto-approve -input=false
 
           # --- 4. Restore Databricks notebooks ---
           - task: Bash@3
@@ -102,6 +83,7 @@ stages:
               targetType: inline
               script: |
                 set -euo pipefail
+                echo "Restoring Databricks notebooks..."
                 python3 scripts/restore_databricks_notebooks.py \
                   --host "$(DATABRICKS_HOST)" \
                   --token "$(DATABRICKS_TOKEN)" \
@@ -116,18 +98,70 @@ stages:
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
-                echo "Restoring dependencies..."
+                echo "Restoring dependencies container..."
                 az storage blob upload-batch \
                   --account-name $STORAGE_ACCOUNT \
                   --destination $DEPENDENCIES_CONTAINER \
                   --source restore_workspace/dependencies \
                   --overwrite
 
-                echo "Restoring results..."
+                echo "Restoring results container..."
                 az storage blob upload-batch \
                   --account-name $STORAGE_ACCOUNT \
                   --destination $RESULTS_CONTAINER \
                   --source restore_workspace/results \
                   --overwrite
+
+          # --- 6. Restore ADF resources ---
+          - task: AzureCLI@2
+            displayName: "Restore ADF resources (pipelines, datasets, triggers, linked services)"
+            inputs:
+              azureSubscription: "etl-service-connection"
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                set -euo pipefail
+
+                base_dir="restore_workspace/adf"
+                echo "Restoring ADF pipelines..."
+                for f in "$base_dir/pipelines"/*.json; do
+                  name=$(basename "$f" .json)
+                  echo "Restoring pipeline: $name"
+                  az datafactory pipeline create \
+                    --name "$name" \
+                    --factory-name $ADF_NAME \
+                    --resource-group $RESOURCE_GROUP \
+                    --pipeline "@$f"
+                done
+
+                echo "Restoring datasets..."
+                for f in "$base_dir/datasets"/*.json; do
+                  name=$(basename "$f" .json)
+                  az datafactory dataset create \
+                    --name "$name" \
+                    --factory-name $ADF_NAME \
+                    --resource-group $RESOURCE_GROUP \
+                    --properties "@$f"
+                done
+
+                echo "Restoring linked services..."
+                for f in "$base_dir/linkedServices"/*.json; do
+                  name=$(basename "$f" .json)
+                  az datafactory linked-service create \
+                    --name "$name" \
+                    --factory-name $ADF_NAME \
+                    --resource-group $RESOURCE_GROUP \
+                    --properties "@$f"
+                done
+
+                echo "Restoring triggers..."
+                for f in "$base_dir/triggers"/*.json; do
+                  name=$(basename "$f" .json)
+                  az datafactory trigger create \
+                    --name "$name" \
+                    --factory-name $ADF_NAME \
+                    --resource-group $RESOURCE_GROUP \
+                    --properties "@$f"
+                done
 
                 echo "Restore completed successfully."
