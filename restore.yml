@@ -1,11 +1,22 @@
 trigger: none
 
+parameters:
+  - name: restoreMode
+    displayName: "Select Restore Mode"
+    type: string
+    default: "full"
+    values:
+      - full
+      - adf
+      - databricks
+      - storage
+
 stages:
   - stage: Restore
-    displayName: "Full Infrastructure and Data Restore"
+    displayName: "Infrastructure and Data Restore"
     jobs:
       - job: RestoreJob
-        displayName: "Apply Terraform, Restore Databricks, Storage, and ADF"
+        displayName: "Restore selected components"
         pool:
           vmImage: 'ubuntu-latest'
 
@@ -31,7 +42,7 @@ stages:
               scriptLocation: inlineScript
               inlineScript: echo "Logged into Azure successfully."
 
-          # --- 1. Download backup ---
+          # --- Always download the backup ---
           - task: AzureCLI@2
             displayName: "Download backup from Storage Account"
             inputs:
@@ -41,14 +52,14 @@ stages:
               inlineScript: |
                 set -euo pipefail
                 mkdir -p restore_workspace
-                echo "Downloading full backup..."
+                echo "Downloading backup data..."
                 az storage blob download-batch \
                   --account-name $STORAGE_ACCOUNT \
                   --source $BACKUP_CONTAINER \
                   --destination restore_workspace \
                   --no-progress
 
-          # --- 2. Validate manifest ---
+          # --- Validate manifest ---
           - task: Bash@3
             displayName: "Validate manifest.json integrity"
             inputs:
@@ -59,26 +70,10 @@ stages:
                   --root restore_workspace \
                   --manifest restore_workspace/manifest.json
 
-          # --- 3. Restore infrastructure using Terraform ---
-          - task: Bash@3
-            displayName: "Restore infrastructure from tfstate (Terraform apply)"
-            inputs:
-              targetType: inline
-              script: |
-                set -euo pipefail
-                echo "Preparing Terraform workspace..."
-                mkdir -p terraform_restore
-                cp restore_workspace/tfstate/*.tfstate terraform_restore/terraform.tfstate
-
-                cd terraform_restore
-                echo "Initializing Terraform..."
-                terraform init -input=false
-                echo "Applying Terraform state..."
-                terraform apply -auto-approve -input=false
-
-          # --- 4. Restore Databricks notebooks ---
+          # --- Restore Databricks notebooks ---
           - task: Bash@3
             displayName: "Restore Databricks notebooks"
+            condition: or(eq('${{ parameters.restoreMode }}', 'full'), eq('${{ parameters.restoreMode }}', 'databricks'))
             inputs:
               targetType: inline
               script: |
@@ -89,9 +84,10 @@ stages:
                   --token "$(DATABRICKS_TOKEN)" \
                   --source "restore_workspace/databricks/notebooks"
 
-          # --- 5. Restore storage containers ---
+          # --- Restore storage containers ---
           - task: AzureCLI@2
             displayName: "Restore dependencies and results containers"
+            condition: or(eq('${{ parameters.restoreMode }}', 'full'), eq('${{ parameters.restoreMode }}', 'storage'))
             inputs:
               azureSubscription: "etl-service-connection"
               scriptType: bash
@@ -112,17 +108,18 @@ stages:
                   --source restore_workspace/results \
                   --overwrite
 
-          # --- 6. Restore ADF resources ---
+          # --- Restore ADF resources ---
           - task: AzureCLI@2
             displayName: "Restore ADF resources (pipelines, datasets, triggers, linked services)"
+            condition: or(eq('${{ parameters.restoreMode }}', 'full'), eq('${{ parameters.restoreMode }}', 'adf'))
             inputs:
               azureSubscription: "etl-service-connection"
               scriptType: bash
               scriptLocation: inlineScript
               inlineScript: |
                 set -euo pipefail
-
                 base_dir="restore_workspace/adf"
+
                 echo "Restoring ADF pipelines..."
                 for f in "$base_dir/pipelines"/*.json; do
                   name=$(basename "$f" .json)
@@ -164,4 +161,4 @@ stages:
                     --properties "@$f"
                 done
 
-                echo "Restore completed successfully."
+                echo "ADF restoration completed successfully."
