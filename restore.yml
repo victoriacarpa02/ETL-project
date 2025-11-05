@@ -70,6 +70,46 @@ stages:
                   --root restore_workspace \
                   --manifest restore_workspace/manifest.json
 
+            # --- Restore Terraform infrastructure ---
+          - task: Bash@3
+            displayName: "Restore Terraform infrastructure"
+            condition: or(eq('${{ parameters.restoreMode }}', 'full'))
+            inputs:
+              targetType: inline
+              script: |
+                set -euo pipefail
+
+                echo "=== Restoring Terraform state and applying infrastructure ==="
+
+                mkdir -p terraform_restore
+                cd terraform_restore
+
+                echo "Downloading Terraform state from Storage..."
+                az storage blob download \
+                  --account-name $STORAGE_ACCOUNT \
+                  --container-name $TFSTATE_CONTAINER \
+                  --name "terraform.tfstate" \
+                  --file "terraform.tfstate" \
+                  --no-progress
+
+                echo "Initializing Terraform..."
+                terraform init \
+                  -backend-config="storage_account_name=$STORAGE_ACCOUNT" \
+                  -backend-config="container_name=$TFSTATE_CONTAINER" \
+                  -backend-config="key=terraform.tfstate" \
+                  -backend-config="resource_group_name=$RESOURCE_GROUP"
+
+                echo "Validating Terraform configuration..."
+                terraform validate
+
+                echo "Planning Terraform apply..."
+                terraform plan -out=tfplan
+
+                echo "Applying Terraform changes..."
+                terraform apply -auto-approve tfplan
+
+                echo "Terraform infrastructure restored successfully."
+
           # --- Restore Databricks notebooks ---
           - task: Bash@3
             displayName: "Restore Databricks notebooks"
